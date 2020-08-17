@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"path"
 	"sync"
 	"time"
 )
@@ -108,7 +109,20 @@ func main() {
 	var method string
 	flag.StringVar(&method, "method", "GET", "HTTP method to use")
 
+	// directory to save files to
+	var saveDir string
+	flag.StringVar(&saveDir, "save", "<VOID>", "directory to save responses to")
+
 	flag.Parse()
+
+	if saveDir != "<VOID>" {
+		if _, err1 := os.Stat(saveDir); os.IsNotExist(err1) {
+			if err2 := os.Mkdir(saveDir, os.ModeDir); err2 != nil {
+				fmt.Fprintf(os.Stderr, "failed to create specified directory: %s\naborting...\n", saveDir)
+				os.Exit(1)
+			}
+		}
+	}
 
 	// make an actual time.Duration out of the timeout
 	timeout := time.Duration(to * 1000000)
@@ -134,6 +148,12 @@ func main() {
 		Timeout:       timeout,
 	}
 
+	redirectClient := &http.Client{
+		Transport:     tr,
+		CheckRedirect: nil,
+		Timeout:       timeout,
+	}
+
 	// domain/port pairs are initially sent on the httpsURLs channel.
 	// If they are listening and the --prefer-https flag is set then
 	// no HTTP check is performed; otherwise they're put onto the httpURLs
@@ -152,7 +172,7 @@ func main() {
 
 				// always try HTTPS first
 				withProto := "https://" + url
-				if isListening(client, withProto, method) {
+				if isListening(client, redirectClient, withProto, method, saveDir) {
 					output <- withProto
 
 					// skip trying HTTP if --prefer-https is set
@@ -176,7 +196,7 @@ func main() {
 		go func() {
 			for url := range httpURLs {
 				withProto := "http://" + url
-				if isListening(client, withProto, method) {
+				if isListening(client, redirectClient, withProto, method, saveDir) {
 					output <- withProto
 					continue
 				}
@@ -250,7 +270,7 @@ func main() {
 	outputWG.Wait()
 }
 
-func isListening(client *http.Client, url, method string) bool {
+func isListening(client, redirectClient *http.Client, url, method, saveDir string) bool {
 
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
@@ -262,8 +282,68 @@ func isListening(client *http.Client, url, method string) bool {
 
 	resp, err := client.Do(req)
 	if resp != nil {
-		io.Copy(ioutil.Discard, resp.Body)
+
+		if saveDir == "<VOID>" {
+			io.Copy(ioutil.Discard, resp.Body)
+		} else {
+
+			src, _ := ioutil.ReadAll(resp.Body)
+
+			// replacer for creating the filename
+            replacer := strings.NewReplacer("://", "_", ".", "_", ":", "_", "/", "_")
+			file := path.Join(saveDir, replacer.Replace(url))
+
+			fm := os.FileMode(int(0644))
+			ioutil.WriteFile(file, src, fm)
+
+		}
+
 		resp.Body.Close()
+
+		if (resp.StatusCode >= 300 && resp.StatusCode < 400) || len(resp.Header["Location"]) != 0 {
+			isRedirectListening(redirectClient, url, method, saveDir)
+		}
+
+	}
+
+	if err != nil {
+		return false
+	}
+
+	return true
+}
+
+
+func isRedirectListening(client *http.Client, url, method, saveDir string) bool {
+
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return false
+	}
+
+	req.Header.Add("Connection", "close")
+	req.Close = true
+
+	resp, err := client.Do(req)
+	if resp != nil {
+
+		if saveDir == "<VOID>" {
+			io.Copy(ioutil.Discard, resp.Body)
+		} else {
+
+			src, _ := ioutil.ReadAll(resp.Body)
+
+			// replacer for creating the filename
+            replacer := strings.NewReplacer("://", "_", ".", "_", ":", "_", "/", "_")
+			file := path.Join(saveDir, replacer.Replace(url) + "_redirect")
+
+			fm := os.FileMode(int(0644))
+			ioutil.WriteFile(file, src, fm)
+
+		}
+
+		resp.Body.Close()
+
 	}
 
 	if err != nil {
